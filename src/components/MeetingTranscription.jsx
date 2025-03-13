@@ -4,142 +4,289 @@ const MeetingTranscription = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState([]);
   const [currentSpeakerId, setCurrentSpeakerId] = useState(1);
-  const [speakerMap, setSpeakerMap] = useState({});
   const [error, setError] = useState("");
   
-  const microphoneRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const socketRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const speakerFeaturesRef = useRef({});
   const lastSpeakerRef = useRef(null);
   const silenceTimeoutRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const streamRef = useRef(null);
   
-  // Replace with your actual Google Cloud API key
+  // Replace with your Google Cloud API key and configuration
   const GOOGLE_API_KEY = "fair-canto-453417-i3";
   
-  // Initialize audio context
-  useEffect(() => {
-    const initAudio = async () => {
-      try {
-        // Create audio context
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        audioContextRef.current = audioContext;
-        
-        // Setup audio analyser for voice activity detection
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        analyserRef.current = analyser;
-      } catch (err) {
-        setError("Error initializing audio: " + err.message);
-      }
-    };
-    
-    initAudio();
-    
-    // Cleanup on unmount
-    return () => {
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-      stopRecording();
-    };
-  }, []);
-  
-  // Process audio data for Google Cloud Speech API
-  const processAudioForGoogleSpeech = async (audioBlob) => {
+  // Start streaming audio to Google Cloud Speech-to-Text API
+  const startStreaming = async (stream) => {
     try {
-      // Convert blob to base64
-      const reader = new FileReader();
-      reader.readAsDataURL(audioBlob);
+      // Stop any existing stream
+      if (socketRef.current) {
+        stopRecording();
+      }
       
-      reader.onloadend = async () => {
-        // Remove the "data:audio/webm;base64," part
-        const base64Audio = reader.result.split(',')[1];
+      // Store the stream
+      micStreamRef.current = stream;
+      
+      // Create audio context for processing
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContext.createMediaStreamSource(stream);
+      
+      // Create analyser for speaker detection
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      
+      // Create processor node for speaker detection
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      analyser.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      // Process audio for speaker detection
+      processor.onaudioprocess = (e) => {
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(data);
+        processAudioFeatures(data);
+      };
+      
+      // Set up WebSocket connection to Google Cloud Speech-to-Text
+      const socketUrl = `wss://speech.googleapis.com/v1/speech:streamingRecognize?key=${GOOGLE_API_KEY}`;
+      const socket = new WebSocket(socketUrl);
+      socketRef.current = socket;
+      
+      // Handle WebSocket events
+      socket.onopen = () => {
+        console.log("WebSocket connection established");
         
-        // Prepare request to Google Cloud Speech-to-Text API
-        const request = {
-          config: {
-            encoding: "WEBM_OPUS",
-            sampleRateHertz: 48000,
-            languageCode: "en-US",
-            enableAutomaticPunctuation: true,
-            enableWordTimeOffsets: true,
-            model: "default",
-            useEnhanced: true
-          },
-          audio: {
-            content: base64Audio
+        // Send configuration
+        const configMessage = {
+          streamingConfig: {
+            config: {
+              encoding: "LINEAR16",
+              sampleRateHertz: 16000,
+              languageCode: "en-US",
+              enableAutomaticPunctuation: true,
+              enableSpeakerDiarization: true,
+              diarizationSpeakerCount: 2,
+              model: "default"
+            },
+            interimResults: true
           }
         };
         
-        // Make request to Google Cloud Speech-to-Text API
-        const response = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${GOOGLE_API_KEY}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(request)
-        });
+        socket.send(JSON.stringify(configMessage));
         
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(`Google API error: ${errorData.error.message}`);
-        }
+        // Set up audio processing for streaming
+        const recorder = new MediaRecorder(stream);
+        recognitionRef.current = recorder;
         
-        const data = await response.json();
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0 && socket.readyState === 1) {
+            // Convert blob to arrayBuffer
+            event.data.arrayBuffer().then(buffer => {
+              // Convert to base64
+              const base64Data = btoa(
+                String.fromCharCode.apply(null, new Uint8Array(buffer))
+              );
+              
+              // Send audio data
+              const audioMessage = {
+                audioContent: base64Data
+              };
+              
+              socket.send(JSON.stringify(audioMessage));
+            });
+          }
+        };
         
-        if (data.results && data.results.length > 0) {
-          const transcript = data.results[0].alternatives[0].transcript;
-          detectSpeakerChange(transcript);
+        // Start recording in chunks
+        recorder.start(100);
+      };
+      
+      socket.onmessage = (event) => {
+        const response = JSON.parse(event.data);
+        
+        // Process streaming recognition results
+        if (response.results && response.results.length > 0) {
+          const result = response.results[0];
+          
+          if (result.alternatives && result.alternatives.length > 0) {
+            const text = result.alternatives[0].transcript;
+            
+            // Only process if we have text
+            if (text && text.trim() !== "") {
+              // Detect speaker changes and update transcript
+              if (result.isFinal) {
+                detectSpeakerChange(text.trim());
+              }
+            }
+          }
         }
       };
+      
+      socket.onerror = (error) => {
+        console.error("WebSocket error:", error);
+        setError("Error with speech recognition: " + error.message);
+      };
+      
+      socket.onclose = () => {
+        console.log("WebSocket connection closed");
+        if (isRecording) {
+          // Try to reconnect if this wasn't intentional
+          setTimeout(() => {
+            if (isRecording && micStreamRef.current) {
+              startStreaming(micStreamRef.current);
+            }
+          }, 1000);
+        }
+      };
+      
+      setIsRecording(true);
+      
     } catch (err) {
-      setError("Error processing audio: " + err.message);
+      setError("Error starting streaming: " + err.message);
     }
   };
   
-  // Start streaming microphone to Google Cloud Speech-to-Text API
-  const startStreaming = async (stream) => {
-    try {
-      // Store the stream for later use
-      streamRef.current = stream;
+  // Process audio features for speaker identification
+  const processAudioFeatures = (dataArray) => {
+    if (!dataArray || dataArray.length === 0) return;
+    
+    // Extract audio features
+    const features = extractAudioFeatures(dataArray);
+    
+    // Store the current audio features
+    lastSpeakerRef.current = {
+      ...lastSpeakerRef.current,
+      features: features
+    };
+  };
+  
+  // Extract audio features for speaker identification
+  const extractAudioFeatures = (dataArray) => {
+    let sum = 0;
+    let energy = 0;
+    let lowFreqEnergy = 0;
+    let highFreqEnergy = 0;
+    
+    for (let i = 0; i < dataArray.length; i++) {
+      sum += dataArray[i];
+      energy += dataArray[i] * dataArray[i];
       
-      // Create MediaRecorder
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-      mediaRecorderRef.current = mediaRecorder;
-      
-      // Reset audio chunks
-      audioChunksRef.current = [];
-      
-      // Handle data available event
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-      
-      // Handle stop event
-      mediaRecorder.onstop = () => {
-        // Create blob from chunks
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        audioChunksRef.current = [];
-        
-        // Process audio with Google Cloud Speech-to-Text
-        processAudioForGoogleSpeech(audioBlob);
-        
-        // Start a new recording if still recording
-        if (isRecording) {
-          mediaRecorderRef.current.start(5000); // Record in 5-second chunks
-        }
-      };
-      
-      // Start recording
-      mediaRecorder.start(5000); // Record in 5-second chunks
-    } catch (err) {
-      setError("Error starting stream: " + err.message);
+      // Split frequency bands
+      if (i < dataArray.length / 2) {
+        lowFreqEnergy += dataArray[i] * dataArray[i];
+      } else {
+        highFreqEnergy += dataArray[i] * dataArray[i];
+      }
     }
+    
+    return {
+      averageFrequency: sum / dataArray.length,
+      energy: energy / dataArray.length,
+      lowFreqEnergy: lowFreqEnergy / (dataArray.length / 2),
+      highFreqEnergy: highFreqEnergy / (dataArray.length / 2),
+      ratio: lowFreqEnergy / (highFreqEnergy || 1) // Avoid division by zero
+    };
+  };
+  
+  // Detect speaker changes based on audio features
+  const detectSpeakerChange = (text) => {
+    // Clear any pending silence detection
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+    }
+    
+    const currentFeatures = lastSpeakerRef.current?.features;
+    
+    // Determine if this is a new speaker
+    const isSpeakerChange = shouldChangeSpeaker(currentFeatures);
+    let speakerId = lastSpeakerRef.current?.id || 1;
+    
+    if (isSpeakerChange) {
+      // Try to identify the speaker or create a new one
+      speakerId = identifySpeaker(currentFeatures) || currentSpeakerId;
+      
+      // Add a new transcript entry
+      setTranscript(prev => [...prev, { id: speakerId, text }]);
+      
+      // Update last speaker
+      lastSpeakerRef.current = {
+        ...lastSpeakerRef.current,
+        id: speakerId
+      };
+      
+      // If this is a new speaker, update the counter
+      if (speakerId === currentSpeakerId) {
+        // Store this speaker's features
+        speakerFeaturesRef.current[speakerId] = currentFeatures;
+        setCurrentSpeakerId(prev => prev + 1);
+      }
+    } else {
+      // Continue with the same speaker
+      setTranscript(prev => {
+        const updated = [...prev];
+        if (updated.length > 0) {
+          updated[updated.length - 1].text += " " + text;
+        } else {
+          updated.push({ id: speakerId, text });
+        }
+        return updated;
+      });
+    }
+    
+    // Set silence detection timeout
+    silenceTimeoutRef.current = setTimeout(() => {
+      lastSpeakerRef.current = {
+        ...lastSpeakerRef.current,
+        id: null
+      };
+    }, 1500);
+  };
+  
+  // Determine if we should change the speaker
+  const shouldChangeSpeaker = (features) => {
+    if (!lastSpeakerRef.current?.id) return true;
+    if (!features) return false;
+    
+    const lastFeatures = lastSpeakerRef.current.features;
+    if (!lastFeatures) return true;
+    
+    // Compare audio features
+    const freqDiff = Math.abs(features.averageFrequency - lastFeatures.averageFrequency);
+    const energyDiff = Math.abs(features.energy - lastFeatures.energy);
+    const ratioDiff = Math.abs(features.ratio - lastFeatures.ratio);
+    
+    // Thresholds for speaker change detection
+    return (freqDiff > 20) || (energyDiff > 1000) || (ratioDiff > 0.4);
+  };
+  
+  // Try to identify if a speaker has been heard before
+  const identifySpeaker = (features) => {
+    if (!features) return null;
+    
+    let bestMatchId = null;
+    let bestMatchScore = 0;
+    
+    // Compare with known speakers
+    Object.entries(speakerFeaturesRef.current).forEach(([id, storedFeatures]) => {
+      const freqDiff = Math.abs(features.averageFrequency - storedFeatures.averageFrequency);
+      const energyDiff = Math.abs(features.energy - storedFeatures.energy);
+      const ratioDiff = Math.abs(features.ratio - storedFeatures.ratio);
+      
+      // Calculate similarity score
+      const similarityScore = 
+        (freqDiff < 15 ? 1 : 0) + 
+        (energyDiff < 800 ? 1 : 0) + 
+        (ratioDiff < 0.3 ? 1 : 0);
+      
+      if (similarityScore > bestMatchScore) {
+        bestMatchScore = similarityScore;
+        bestMatchId = parseInt(id);
+      }
+    });
+    
+    // Need at least 2 matching features to identify a speaker
+    return bestMatchScore >= 2 ? bestMatchId : null;
   };
   
   // Start recording with microphone
@@ -149,85 +296,83 @@ const MeetingTranscription = () => {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: 48000
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true
         },
         video: false
       });
       
-      // Connect microphone to audio context for speaker identification
-      const microphoneSource = audioContextRef.current.createMediaStreamSource(stream);
-      microphoneSource.connect(analyserRef.current);
-      
-      // Create script processor for audio analysis
-      const bufferSize = 4096;
-      const processor = audioContextRef.current.createScriptProcessor(bufferSize, 1, 1);
-      processor.onaudioprocess = processAudioForSpeakerDetection;
-      
-      // Connect the processor
-      analyserRef.current.connect(processor);
-      processor.connect(audioContextRef.current.destination);
-      
-      // Store references
-      microphoneRef.current = {
-        stream,
-        source: microphoneSource,
-        processor
-      };
-      
-      // Start streaming to Google Cloud Speech-to-Text
-      startStreaming(stream);
-      
-      // Reset the transcription with the first speaker
+      // Initialize transcript
       setTranscript([]);
       setCurrentSpeakerId(1);
-      setSpeakerMap({});
-      setIsRecording(true);
+      speakerFeaturesRef.current = {};
+      lastSpeakerRef.current = null;
+      
+      // Start streaming to Google Cloud Speech API
+      startStreaming(stream);
       
     } catch (err) {
       setError("Error accessing microphone: " + err.message);
     }
   };
   
-  // Audio processing callback for speaker detection
-  const processAudioForSpeakerDetection = (e) => {
-    // Get audio features for speaker detection
-    if (analyserRef.current) {
-      const bufferLength = analyserRef.current.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-      analyserRef.current.getByteFrequencyData(dataArray);
+  // Capture system audio
+  const captureSystemAudio = async () => {
+    try {
+      // Request display capture with audio
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true
+      });
       
-      // Store audio features for speaker identification
-      const audioFeatures = getAudioFeatures(dataArray);
-      lastSpeakerRef.current = {
-        ...lastSpeakerRef.current,
-        features: audioFeatures
-      };
+      // Check if we have audio
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        throw new Error("No audio track found. Make sure to select 'Share audio' when prompted.");
+      }
+      
+      // Create a new stream with just the audio
+      const audioStream = new MediaStream([audioTracks[0]]);
+      
+      // Initialize transcript
+      setTranscript([]);
+      setCurrentSpeakerId(1);
+      speakerFeaturesRef.current = {};
+      lastSpeakerRef.current = null;
+      
+      // Start streaming
+      startStreaming(audioStream);
+      
+    } catch (err) {
+      setError("Error capturing system audio: " + err.message);
     }
   };
   
   // Stop recording
   const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+    // Close WebSocket connection
+    if (socketRef.current) {
+      socketRef.current.close();
+      socketRef.current = null;
     }
     
-    if (microphoneRef.current) {
-      // Disconnect and stop all audio processing
-      microphoneRef.current.source.disconnect();
-      if (microphoneRef.current.processor) {
-        microphoneRef.current.processor.disconnect();
-      }
-      
-      // Stop all tracks in the stream
-      microphoneRef.current.stream.getTracks().forEach(track => track.stop());
-      
-      // Clear the reference
-      microphoneRef.current = null;
+    // Stop MediaRecorder
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
     }
     
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
+    // Stop all tracks in the stream
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(track => track.stop());
+      micStreamRef.current = null;
+    }
+    
+    // Clear silence detection timeout
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = null;
     }
     
     setIsRecording(false);
@@ -242,197 +387,13 @@ const MeetingTranscription = () => {
     }
   };
   
-  // Capture system audio for meetings
-  const captureSystemAudio = async () => {
-    try {
-      // Request display capture with audio
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true
-      });
-      
-      // Check if we have audio tracks
-      const audioTracks = stream.getAudioTracks();
-      if (audioTracks.length === 0) {
-        throw new Error("No audio track found in screen capture. Make sure to select 'Share audio' when prompted.");
-      }
-      
-      // Create a new stream with just the audio track
-      const audioStream = new MediaStream([audioTracks[0]]);
-      
-      // Connect to audio context for speaker identification
-      const source = audioContextRef.current.createMediaStreamSource(audioStream);
-      source.connect(analyserRef.current);
-      
-      // Create script processor for audio analysis
-      const bufferSize = 4096;
-      const processor = audioContextRef.current.createScriptProcessor(bufferSize, 1, 1);
-      processor.onaudioprocess = processAudioForSpeakerDetection;
-      
-      // Connect the processor
-      analyserRef.current.connect(processor);
-      processor.connect(audioContextRef.current.destination);
-      
-      // Store references
-      microphoneRef.current = {
-        stream: audioStream,
-        source,
-        processor,
-        displayStream: stream // Keep reference to stop it later
-      };
-      
-      // Start streaming to Google Cloud Speech-to-Text
-      startStreaming(audioStream);
-      
-      // Reset the transcription with the first speaker
-      setTranscript([]);
-      setCurrentSpeakerId(1);
-      setSpeakerMap({});
-      setIsRecording(true);
-      
-    } catch (err) {
-      setError("Error capturing system audio: " + err.message);
-    }
-  };
-  
-  // Detect speaker changes based on silence and audio characteristics
-  const detectSpeakerChange = (text) => {
-    if (!text || text.trim() === "") return;
-    
-    // Clear any pending silence detection
-    if (silenceTimeoutRef.current) {
-      clearTimeout(silenceTimeoutRef.current);
-    }
-    
-    const audioFeatures = lastSpeakerRef.current?.features;
-    
-    // Simple algorithm: if silence for more than 1.5s or significant change in audio features
-    const shouldChangeSpeaker = 
-      !lastSpeakerRef.current?.id || 
-      (audioFeatures && audioFeaturesDifferSignificantly(audioFeatures));
-    
-    if (shouldChangeSpeaker) {
-      // Determine if this is a new speaker or a returning one
-      const speakerId = identifySpeaker(audioFeatures) || currentSpeakerId;
-      
-      // Add a new entry for a new speaker
-      setTranscript(prev => [...prev, { id: speakerId, text: text.trim() }]);
-      
-      // Update last speaker reference
-      lastSpeakerRef.current = {
-        ...lastSpeakerRef.current,
-        id: speakerId
-      };
-      
-      // If this is a truly new speaker, increment the counter
-      if (!Object.values(speakerMap).includes(speakerId)) {
-        setCurrentSpeakerId(prev => prev + 1);
-      }
-    } else {
-      // Continue with the same speaker
-      setTranscript(prev => {
-        const updated = [...prev];
-        if (updated.length > 0) {
-          updated[updated.length - 1].text += " " + text.trim();
-        } else {
-          updated.push({ id: lastSpeakerRef.current?.id || currentSpeakerId, text: text.trim() });
-        }
-        return updated;
-      });
-    }
-    
-    // Set timeout to detect silence between speakers
-    silenceTimeoutRef.current = setTimeout(() => {
-      lastSpeakerRef.current = {
-        ...lastSpeakerRef.current,
-        id: null
-      };
-    }, 1500);
-  };
-  
-  // Get audio features for speaker identification
-  const getAudioFeatures = (dataArray) => {
-    if (!dataArray) return null;
-    
-    // Calculate simple features: average frequency and energy
-    let sum = 0;
-    let energy = 0;
-    let lowFreqEnergy = 0;
-    let highFreqEnergy = 0;
-    
-    for (let i = 0; i < dataArray.length; i++) {
-      sum += dataArray[i];
-      energy += dataArray[i] * dataArray[i];
-      
-      // Split frequency spectrum for better fingerprinting
-      if (i < dataArray.length / 2) {
-        lowFreqEnergy += dataArray[i] * dataArray[i];
-      } else {
-        highFreqEnergy += dataArray[i] * dataArray[i];
-      }
-    }
-    
-    return {
-      averageFrequency: sum / dataArray.length,
-      energy: energy / dataArray.length,
-      lowFreqEnergy: lowFreqEnergy / (dataArray.length / 2),
-      highFreqEnergy: highFreqEnergy / (dataArray.length / 2),
-      ratio: lowFreqEnergy / (highFreqEnergy || 1) // Prevent division by zero
-    };
-  };
-  
-  // Compare audio features to detect significant changes
-  const audioFeaturesDifferSignificantly = (features) => {
-    if (!lastSpeakerRef.current?.features) return true;
-    
-    const lastFeatures = lastSpeakerRef.current.features;
-    const freqDiff = Math.abs(features.averageFrequency - lastFeatures.averageFrequency);
-    const energyDiff = Math.abs(features.energy - lastFeatures.energy);
-    const ratioDiff = Math.abs(features.ratio - lastFeatures.ratio);
-    
-    // Weighted comparison for better detection
-    return (freqDiff > 20) || (energyDiff > 1000) || (ratioDiff > 0.3);
-  };
-  
-  // Identify if a speaker has been heard before
-  const identifySpeaker = (features) => {
-    if (!features) return null;
-    
-    // Check if these features match any previous speaker
-    for (const [speakerId, speakerFeatures] of Object.entries(speakerMap)) {
-      const freqDiff = Math.abs(features.averageFrequency - speakerFeatures.averageFrequency);
-      const energyDiff = Math.abs(features.energy - speakerFeatures.energy);
-      const ratioDiff = Math.abs(features.ratio - speakerFeatures.ratio);
-      
-      // Weight different features for better identification
-      const similarityScore = 
-        (freqDiff < 15 ? 1 : 0) + 
-        (energyDiff < 800 ? 1 : 0) + 
-        (ratioDiff < 0.2 ? 1 : 0);
-      
-      if (similarityScore >= 2) {
-        return parseInt(speakerId);
-      }
-    }
-    
-    // If no match, add to speaker map
-    setSpeakerMap(prev => ({
-      ...prev,
-      [currentSpeakerId]: features
-    }));
-    
-    return null;
-  };
-  
-  // Export transcript to text file
+  // Export transcript to file
   const exportTranscript = () => {
     if (transcript.length === 0) return;
     
     let content = "";
     transcript.forEach(entry => {
-      if (entry.text) {
-        content += `Speaker ${entry.id}: ${entry.text}\n\n`;
-      }
+      content += `Speaker ${entry.id}: ${entry.text}\n\n`;
     });
     
     const blob = new Blob([content], { type: 'text/plain' });
@@ -446,18 +407,31 @@ const MeetingTranscription = () => {
     URL.revokeObjectURL(url);
   };
   
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      stopRecording();
+    };
+  }, []);
+  
   return (
     <div className="flex flex-col p-4 max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-4">Meeting Transcription</h1>
       
-      {error && <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">{error}</div>}
+      {error && (
+        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
+          {error}
+        </div>
+      )}
       
       <div className="flex gap-4 mb-4">
         <button
           onClick={handleToggleRecording}
-          className={`px-4 py-2 rounded font-bold ${isRecording ? 'bg-red-500 text-white' : 'bg-blue-500 text-white'}`}
+          className={`px-4 py-2 rounded font-bold ${
+            isRecording ? "bg-red-500 text-white" : "bg-blue-500 text-white"
+          }`}
         >
-          {isRecording ? 'Stop Recording' : 'Start Recording (Microphone)'}
+          {isRecording ? "Stop Recording" : "Start Recording (Microphone)"}
         </button>
         
         <button
@@ -493,7 +467,14 @@ const MeetingTranscription = () => {
       </div>
       
       <div className="mt-4 text-sm text-gray-600">
-        <p>Note: For system audio capture, you need a virtual audio cable like VB-Audio VoiceMeeter to route system audio to the browser.</p>
+        <p>
+          Note: For system audio capture, you may need a virtual audio cable to
+          route system audio to the browser.
+        </p>
+        <p>
+          Make sure to set up Google Cloud Speech-to-Text API and replace the API
+          key before using this component.
+        </p>
       </div>
     </div>
   );
