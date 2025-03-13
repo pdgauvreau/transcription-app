@@ -5,6 +5,7 @@ const MeetingTranscription = () => {
   const [transcript, setTranscript] = useState([]);
   const [currentSpeakerId, setCurrentSpeakerId] = useState(1);
   const [error, setError] = useState("");
+  const [debugLog, setDebugLog] = useState([]);
   
   const micStreamRef = useRef(null);
   const socketRef = useRef(null);
@@ -13,8 +14,14 @@ const MeetingTranscription = () => {
   const lastSpeakerRef = useRef(null);
   const silenceTimeoutRef = useRef(null);
   
-  // Replace with your Google Cloud API key and configuration
-  const GOOGLE_API_KEY = "fair-canto-453417-i3";
+  // Replace with your Google Cloud API key
+  const GOOGLE_API_KEY = "AIzaSyAp11NdBUly96-HgOu_ieXGNPHnoerXdAU";
+  
+  // Add debug logging
+  const addLog = (message) => {
+    console.log(message);
+    setDebugLog(prev => [...prev, { time: new Date().toISOString(), message }]);
+  };
   
   // Start streaming audio to Google Cloud Speech-to-Text API
   const startStreaming = async (stream) => {
@@ -24,40 +31,23 @@ const MeetingTranscription = () => {
         stopRecording();
       }
       
+      addLog("Starting audio stream");
+      
       // Store the stream
       micStreamRef.current = stream;
       
-      // Create audio context for processing
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const source = audioContext.createMediaStreamSource(stream);
+      // Create WebSocket connection
+      const socketUrl = `wss://speech.googleapis.com/v1p1beta1/speech:streamingRecognize?key=${GOOGLE_API_KEY}`;
+      addLog(`Connecting to WebSocket: ${socketUrl}`);
       
-      // Create analyser for speaker detection
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 1024;
-      source.connect(analyser);
-      
-      // Create processor node for speaker detection
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      analyser.connect(processor);
-      processor.connect(audioContext.destination);
-      
-      // Process audio for speaker detection
-      processor.onaudioprocess = (e) => {
-        const data = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteFrequencyData(data);
-        processAudioFeatures(data);
-      };
-      
-      // Set up WebSocket connection to Google Cloud Speech-to-Text
-      const socketUrl = `wss://speech.googleapis.com/v1/speech:streamingRecognize?key=${GOOGLE_API_KEY}`;
       const socket = new WebSocket(socketUrl);
       socketRef.current = socket;
       
-      // Handle WebSocket events
+      // Set up WebSocket event handlers
       socket.onopen = () => {
-        console.log("WebSocket connection established");
+        addLog("WebSocket connection opened");
         
-        // Send configuration
+        // Send configuration message
         const configMessage = {
           streamingConfig: {
             config: {
@@ -67,84 +57,163 @@ const MeetingTranscription = () => {
               enableAutomaticPunctuation: true,
               enableSpeakerDiarization: true,
               diarizationSpeakerCount: 2,
-              model: "default"
+              model: "default",
+              useEnhanced: true
             },
             interimResults: true
           }
         };
         
+        addLog("Sending config: " + JSON.stringify(configMessage));
         socket.send(JSON.stringify(configMessage));
         
-        // Set up audio processing for streaming
-        const recorder = new MediaRecorder(stream);
-        recognitionRef.current = recorder;
-        
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0 && socket.readyState === 1) {
-            // Convert blob to arrayBuffer
-            event.data.arrayBuffer().then(buffer => {
-              // Convert to base64
-              const base64Data = btoa(
-                String.fromCharCode.apply(null, new Uint8Array(buffer))
-              );
-              
-              // Send audio data
-              const audioMessage = {
-                audioContent: base64Data
-              };
-              
-              socket.send(JSON.stringify(audioMessage));
-            });
-          }
-        };
-        
-        // Start recording in chunks
-        recorder.start(100);
+        // Set up audio processing
+        setupAudioProcessing(stream, socket);
       };
       
       socket.onmessage = (event) => {
-        const response = JSON.parse(event.data);
-        
-        // Process streaming recognition results
-        if (response.results && response.results.length > 0) {
-          const result = response.results[0];
+        try {
+          const response = JSON.parse(event.data);
+          addLog("Received response: " + JSON.stringify(response));
           
-          if (result.alternatives && result.alternatives.length > 0) {
-            const text = result.alternatives[0].transcript;
+          // Handle recognition results
+          if (response.results && response.results.length > 0) {
+            const result = response.results[0];
             
-            // Only process if we have text
-            if (text && text.trim() !== "") {
-              // Detect speaker changes and update transcript
-              if (result.isFinal) {
-                detectSpeakerChange(text.trim());
+            if (result.alternatives && result.alternatives.length > 0) {
+              const text = result.alternatives[0].transcript;
+              addLog(`Recognized text: ${text}`);
+              
+              if (text && text.trim() !== "") {
+                if (result.isFinal) {
+                  addLog("Final result received");
+                  detectSpeakerChange(text.trim());
+                }
               }
             }
+          } else if (response.error) {
+            setError(`API Error: ${response.error.message}`);
+            addLog(`API Error: ${JSON.stringify(response.error)}`);
           }
+        } catch (err) {
+          addLog(`Error parsing message: ${err.message}`);
         }
       };
       
-      socket.onerror = (error) => {
-        console.error("WebSocket error:", error);
-        setError("Error with speech recognition: " + error.message);
+      socket.onerror = (err) => {
+        const errorMessage = err.message || "Unknown WebSocket error";
+        addLog(`WebSocket error: ${errorMessage}`);
+        setError(`Speech recognition error: ${errorMessage}`);
       };
       
-      socket.onclose = () => {
-        console.log("WebSocket connection closed");
-        if (isRecording) {
+      socket.onclose = (event) => {
+        addLog(`WebSocket closed: ${event.code} - ${event.reason}`);
+        
+        if (isRecording && event.code !== 1000) {
           // Try to reconnect if this wasn't intentional
+          addLog("Attempting to reconnect...");
           setTimeout(() => {
             if (isRecording && micStreamRef.current) {
               startStreaming(micStreamRef.current);
             }
-          }, 1000);
+          }, 2000);
         }
       };
       
       setIsRecording(true);
       
     } catch (err) {
-      setError("Error starting streaming: " + err.message);
+      addLog(`Error in startStreaming: ${err.message}`);
+      setError(`Error starting streaming: ${err.message}`);
     }
+  };
+  
+  // Set up audio processing for streaming
+  const setupAudioProcessing = (stream, socket) => {
+    try {
+      addLog("Setting up audio processing");
+      
+      // Create audio context for processing
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 16000 // Match the sample rate with our config
+      });
+      
+      const source = audioContext.createMediaStreamSource(stream);
+      
+      // Create script processor for audio streaming
+      const bufferSize = 4096;
+      const recorder = audioContext.createScriptProcessor(bufferSize, 1, 1);
+      
+      // Connect the nodes
+      source.connect(recorder);
+      recorder.connect(audioContext.destination);
+      
+      // Process audio data
+      recorder.onaudioprocess = (e) => {
+        if (socket.readyState === 1) {
+          // Get audio data
+          const inputData = e.inputBuffer.getChannelData(0);
+          
+          // Convert float32 to int16
+          const int16Data = new Int16Array(inputData.length);
+          for (let i = 0; i < inputData.length; i++) {
+            // Convert float [-1.0, 1.0] to int16 [-32768, 32767]
+            int16Data[i] = Math.min(1, Math.max(-1, inputData[i])) * 32767;
+          }
+          
+          // Convert to base64
+          const base64Data = arrayBufferToBase64(int16Data.buffer);
+          
+          // Send audio data
+          const audioMessage = {
+            audioContent: base64Data
+          };
+          
+          socket.send(JSON.stringify(audioMessage));
+        }
+      };
+      
+      // Store for cleanup
+      recognitionRef.current = {
+        audioContext,
+        source,
+        recorder
+      };
+      
+      // Create analyser for speaker detection
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      
+      // Process audio for speaker detection
+      const detectSpeaker = () => {
+        if (!analyser) return;
+        
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(data);
+        processAudioFeatures(data);
+        
+        if (isRecording) {
+          requestAnimationFrame(detectSpeaker);
+        }
+      };
+      
+      detectSpeaker();
+      
+    } catch (err) {
+      addLog(`Error in setupAudioProcessing: ${err.message}`);
+      setError(`Error processing audio: ${err.message}`);
+    }
+  };
+  
+  // Helper: Convert ArrayBuffer to Base64
+  const arrayBufferToBase64 = (buffer) => {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
   };
   
   // Process audio features for speaker identification
@@ -191,6 +260,8 @@ const MeetingTranscription = () => {
   
   // Detect speaker changes based on audio features
   const detectSpeakerChange = (text) => {
+    addLog(`Detecting speaker for: "${text}"`);
+    
     // Clear any pending silence detection
     if (silenceTimeoutRef.current) {
       clearTimeout(silenceTimeoutRef.current);
@@ -203,6 +274,8 @@ const MeetingTranscription = () => {
     let speakerId = lastSpeakerRef.current?.id || 1;
     
     if (isSpeakerChange) {
+      addLog("Speaker change detected");
+      
       // Try to identify the speaker or create a new one
       speakerId = identifySpeaker(currentFeatures) || currentSpeakerId;
       
@@ -222,6 +295,8 @@ const MeetingTranscription = () => {
         setCurrentSpeakerId(prev => prev + 1);
       }
     } else {
+      addLog("Continuing with the same speaker");
+      
       // Continue with the same speaker
       setTranscript(prev => {
         const updated = [...prev];
@@ -292,8 +367,10 @@ const MeetingTranscription = () => {
   // Start recording with microphone
   const startRecording = async () => {
     try {
+      addLog("Starting microphone recording");
+      
       // Request microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const constraints = {
         audio: {
           channelCount: 1,
           sampleRate: 16000,
@@ -301,25 +378,35 @@ const MeetingTranscription = () => {
           noiseSuppression: true
         },
         video: false
-      });
+      };
+      
+      addLog("Requesting microphone with constraints: " + JSON.stringify(constraints));
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      
+      addLog("Microphone access granted");
       
       // Initialize transcript
       setTranscript([]);
       setCurrentSpeakerId(1);
       speakerFeaturesRef.current = {};
       lastSpeakerRef.current = null;
+      setDebugLog([]);
+      setError("");
       
       // Start streaming to Google Cloud Speech API
       startStreaming(stream);
       
     } catch (err) {
-      setError("Error accessing microphone: " + err.message);
+      addLog(`Error accessing microphone: ${err.message}`);
+      setError(`Error accessing microphone: ${err.message}`);
     }
   };
   
   // Capture system audio
   const captureSystemAudio = async () => {
     try {
+      addLog("Starting system audio capture");
+      
       // Request display capture with audio
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
@@ -332,6 +419,8 @@ const MeetingTranscription = () => {
         throw new Error("No audio track found. Make sure to select 'Share audio' when prompted.");
       }
       
+      addLog("System audio capture successful");
+      
       // Create a new stream with just the audio
       const audioStream = new MediaStream([audioTracks[0]]);
       
@@ -340,32 +429,55 @@ const MeetingTranscription = () => {
       setCurrentSpeakerId(1);
       speakerFeaturesRef.current = {};
       lastSpeakerRef.current = null;
+      setDebugLog([]);
+      setError("");
       
       // Start streaming
       startStreaming(audioStream);
       
     } catch (err) {
-      setError("Error capturing system audio: " + err.message);
+      addLog(`Error capturing system audio: ${err.message}`);
+      setError(`Error capturing system audio: ${err.message}`);
     }
   };
   
   // Stop recording
   const stopRecording = () => {
+    addLog("Stopping recording");
+    
     // Close WebSocket connection
     if (socketRef.current) {
       socketRef.current.close();
       socketRef.current = null;
     }
     
-    // Stop MediaRecorder
+    // Stop audio processing
     if (recognitionRef.current) {
-      recognitionRef.current.stop();
+      const { audioContext, source, recorder } = recognitionRef.current;
+      
+      if (recorder) {
+        recorder.disconnect();
+      }
+      
+      if (source) {
+        source.disconnect();
+      }
+      
+      if (audioContext) {
+        // Don't close the AudioContext as it might be reused
+        // Just suspend it
+        audioContext.suspend();
+      }
+      
       recognitionRef.current = null;
     }
     
     // Stop all tracks in the stream
     if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach(track => track.stop());
+      micStreamRef.current.getTracks().forEach(track => {
+        track.stop();
+        addLog(`Stopped track: ${track.kind}`);
+      });
       micStreamRef.current = null;
     }
     
@@ -376,6 +488,7 @@ const MeetingTranscription = () => {
     }
     
     setIsRecording(false);
+    addLog("Recording stopped");
   };
   
   // Toggle recording state
@@ -391,6 +504,7 @@ const MeetingTranscription = () => {
   const exportTranscript = () => {
     if (transcript.length === 0) return;
     
+    addLog("Exporting transcript");
     let content = "";
     transcript.forEach(entry => {
       content += `Speaker ${entry.id}: ${entry.text}\n\n`;
@@ -407,6 +521,11 @@ const MeetingTranscription = () => {
     URL.revokeObjectURL(url);
   };
   
+  // Clear error message
+  const clearError = () => {
+    setError("");
+  };
+  
   // Clean up on unmount
   useEffect(() => {
     return () => {
@@ -414,13 +533,55 @@ const MeetingTranscription = () => {
     };
   }, []);
   
+  // Test API connection
+  const testAPIConnection = async () => {
+    try {
+      addLog("Testing API connection");
+      
+      // Create a simple request to test the API key
+      const url = `https://speech.googleapis.com/v1/speech:recognize?key=${GOOGLE_API_KEY}`;
+      const testRequest = {
+        config: {
+          encoding: "LINEAR16",
+          sampleRateHertz: 16000,
+          languageCode: "en-US",
+        },
+        audio: {
+          content: "" // Empty audio content for testing
+        }
+      };
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(testRequest)
+      });
+      
+      const data = await response.json();
+      
+      if (response.ok) {
+        addLog("API connection successful");
+        setError("API connection successful. You can now start recording.");
+      } else {
+        addLog(`API connection failed: ${JSON.stringify(data)}`);
+        setError(`API connection failed: ${data.error?.message || 'Unknown error'}`);
+      }
+    } catch (err) {
+      addLog(`Error testing API: ${err.message}`);
+      setError(`Error testing API connection: ${err.message}`);
+    }
+  };
+  
   return (
     <div className="flex flex-col p-4 max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-4">Meeting Transcription</h1>
       
       {error && (
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-          {error}
+        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4 flex justify-between">
+          <span>{error}</span>
+          <button onClick={clearError} className="font-bold">×</button>
         </div>
       )}
       
@@ -449,6 +610,14 @@ const MeetingTranscription = () => {
         >
           Export Transcript
         </button>
+        
+        <button
+          onClick={testAPIConnection}
+          className="px-4 py-2 rounded font-bold bg-yellow-500 text-white"
+          disabled={isRecording}
+        >
+          Test API Connection
+        </button>
       </div>
       
       <div className="border rounded p-4 bg-gray-50 min-h-64 max-h-96 overflow-y-auto">
@@ -466,14 +635,31 @@ const MeetingTranscription = () => {
         )}
       </div>
       
+      <div className="mt-4">
+        <h2 className="font-bold mb-2">Debug Log</h2>
+        <div className="border rounded p-4 bg-gray-50 text-xs font-mono h-32 overflow-y-auto">
+          {debugLog.length === 0 ? (
+            <p className="text-gray-500">Log messages will appear here...</p>
+          ) : (
+            <div>
+              {debugLog.map((log, index) => (
+                <div key={index} className="mb-1">
+                  <span className="text-gray-500">[{log.time}]</span> {log.message}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+      
       <div className="mt-4 text-sm text-gray-600">
         <p>
-          Note: For system audio capture, you may need a virtual audio cable to
-          route system audio to the browser.
+          Important: You must set a valid Google Cloud Speech-to-Text API key in the code.
+          Replace "YOUR_GOOGLE_CLOUD_API_KEY" with your actual API key.
         </p>
         <p>
-          Make sure to set up Google Cloud Speech-to-Text API and replace the API
-          key before using this component.
+          Make sure to enable the Speech-to-Text API in your Google Cloud console and
+          configure CORS to allow requests from your domain.
         </p>
       </div>
     </div>
