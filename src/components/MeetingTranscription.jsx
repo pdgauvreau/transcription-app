@@ -15,7 +15,7 @@ const MeetingTranscription = () => {
   const silenceTimeoutRef = useRef(null);
   
   // Replace with your Google Cloud API key
-  const GOOGLE_API_KEY = "AIzaSyAp11NdBUly96-HgOu_ieXGNPHnoerXdAU";
+  const GOOGLE_API_KEY = "APIKEYHERE";
   
   // Add debug logging
   const addLog = (message) => {
